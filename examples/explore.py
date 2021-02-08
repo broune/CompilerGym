@@ -11,13 +11,14 @@ the search space. Can also be configured to do a beam search.
 
 Example usage:
 
-    $ python explore.py --env=llvm-ic-v0 --benchmark=cBench-v0/dijkstra \
+    $ python explore.py --env=llvm-v0 --benchmark=cBench-v0/dijkstra \
        --episode_length=10 --actions=-simplifycfg,-instcombine,-mem2reg,-newgvn
 
 Use --help to list the configurable options.
 """
 import hashlib
 import itertools
+import json
 import math
 from enum import IntEnum
 from heapq import nlargest
@@ -28,6 +29,7 @@ from threading import Lock
 from time import time
 
 import humanize
+import numpy
 from absl import app, flags
 
 from compiler_gym.util.flags.benchmark_from_flags import benchmark_from_flags
@@ -49,7 +51,18 @@ flags.DEFINE_integer(
     "This is in effect the width of a beam search.",
 )
 flags.DEFINE_integer(
-    "show_topn", 3, "Show this many top sequences " "at each sequence length."
+    "show_topn", 3, "Show this many top sequences at each sequence length."
+)
+flags.DEFINE_string(
+    "record_file",
+    "",
+    "If flag set, write an optimal trajectory to this file. Use "
+    "/dev/stdout to print to standard output.",
+)
+flags.DEFINE_list("record_observations", [], "Observations to record to trajectory.")
+flags.DEFINE_list("record_rewards", [], "Rewards to record to trajectory.")
+flags.DEFINE_bool(
+    "pretty_json", False, "Pretty-print the Json output for the trajectory."
 )
 
 FLAGS = flags.FLAGS
@@ -86,6 +99,9 @@ class CustomEnv:
     def action_names(self, actions):
         return [self._action_names[a] for a in actions]
 
+    def action_name(self, action):
+        return self._action_names[action]
+
     def step(self, action):
         return self._env.step(self._action_indices[action])
 
@@ -102,8 +118,26 @@ class CustomEnv:
         return range(self.action_count())
 
     @property
-    def observation(self):
+    def observations(self):
         return self._env.observation
+
+    @property
+    def benchmark(self):
+        return self._env.benchmark
+
+    @benchmark.setter
+    def benchmark(self, value):
+        self._env.benchmark = value
+        return self._env.benchmark
+
+    @property
+    def reward_space(self):
+        return self._env.reward_space
+
+    @reward_space.setter
+    def reward_space(self, value):
+        self._env.reward_space = value
+        return self._env.reward_space
 
 
 # Used to determine if two rewards are equal up to a small
@@ -122,6 +156,7 @@ class Node:
         self.reward_sum = reward_sum
         self.edges = [NO_EDGE] * edge_count
         self.back_edge = None
+        self.value = None
 
 
 # Represents env states as nodes and actions as edges.
@@ -177,8 +212,19 @@ class StateGraph:
         path.reverse()
         return path
 
+    # Sum of rewards along paths that lead to this node.
     def reward_sum(self, node_index):
         return self._nodes[node_index].reward_sum
+
+    # Best sum of rewards from this node.
+    def value(self, node_index):
+        return self._nodes[node_index].value
+
+    def set_value(self, node_index, value):
+        self._nodes[node_index].value = value
+
+    def edges(self, node_index):
+        return self._nodes[node_index].edges
 
     def node_count(self):
         return len(self._nodes)
@@ -190,11 +236,11 @@ def env_to_fingerprint(env):
     # consider adding a fingerprint observation to env.
     if False:
         # BitcodeFile is slower, so using Ir instead.
-        path = env.observation["BitcodeFile"]
+        path = env.observations["BitcodeFile"]
         with open(path, "rb") as f:
             data = f.read()
     else:
-        data = env.observation["Ir"].encode()
+        data = env.observations["Ir"].encode()
 
     return hashlib.sha256(data).digest()
 
@@ -204,8 +250,8 @@ def compute_edges(env, sequence):
     for action in env.actions():
         env.reset()
         reward_sum = 0.0
-        for action in sequence + [action]:
-            _, reward, _, _ = env.step(action)
+        for a in sequence + [action]:
+            _, reward, _, _ = env.step(a)
             reward_sum += reward
 
         edges.append((env_to_fingerprint(env), reward_sum))
@@ -480,6 +526,68 @@ def compute_action_graph(envs, episode_length):
 
         stats.end_depth_and_print(envs[0], graph, best_node)
 
+    return graph, best_node
+
+
+# Returns a JSON-serializable object noting the given observations and
+# rewards for the nodes along the sequence / trajectory of actions.
+def make_trajectory_json(env, benchmark, sequence, observations, rewards):
+    env.benchmark = benchmark
+    env.reset()  # .benchmark only takes on new value after reset()
+    benchmark = env.benchmark  # canonicalizes the benchmark name
+
+    data = {"name": benchmark}
+
+    seq_data = []
+    for i in range(len(sequence) + 1):
+        state_data = make_state_json(env, sequence[0:i], observations, rewards)
+
+        # The last state doesn't have a next action in the sequence.
+        if i < len(sequence):
+            state_data["action"] = env.action_name(sequence[i])
+        seq_data.append(state_data)
+    data["trajectory"] = seq_data
+
+    return data
+
+
+# Returns a JSON-serializable object noting the given observations and
+# rewards for the state that is arrived at by the given sequence of
+# actions.
+def make_state_json(env, sequence, observations, rewards):
+    node_data = {}
+
+    if observations:
+        env.reset()
+        for a in sequence:
+            env.step(a)
+        obs_data = {}
+        for obs in observations:
+            value = env.observations[obs]
+
+            # Convert away from NumPy arrays as the Json library
+            # cannnot serialize them.
+            if isinstance(value, numpy.ndarray):
+                value = value.tolist()
+            obs_data[obs] = value
+        node_data["observations"] = obs_data
+
+    if rewards:
+        rewards_data = {}
+        for reward in rewards:
+            reward_data = {}
+            for action in env.actions():
+                env.reward_space = reward
+                env.reset()
+                for a in sequence + [action]:
+                    _, value, _, _ = env.step(a)
+                # Record the reward for the last action.
+                reward_data[env.action_name(action)] = value
+            rewards_data[reward] = reward_data
+        node_data["rewards"] = rewards_data
+
+    return node_data
+
 
 def main(argv):
     """Main entry point."""
@@ -493,11 +601,37 @@ def main(argv):
         envs = []
         for _ in range(FLAGS.nproc):
             envs.append(CustomEnv())
-        compute_action_graph(envs, episode_length=FLAGS.episode_length)
-    except:
+        graph, best_node = compute_action_graph(
+            envs, episode_length=FLAGS.episode_length
+        )
+
+        if FLAGS.record_file:
+            envs[0].reset()
+            sequence = graph.node_path(best_node)
+
+            json_obj = make_trajectory_json(
+                envs[0],
+                envs[0].benchmark,
+                sequence,
+                FLAGS.record_observations,
+                FLAGS.record_rewards,
+            )
+
+            with open(FLAGS.record_file, "w") as f:
+                json.dump(json_obj, f, indent=2 if FLAGS.pretty_json else None)
+        # TODO:
+        #
+        # 2: my env wrapper is getting out of hand, fix it up at the source instead
+        # 3: set up value function with a backwards topological dynamic algorithm
+        # 4: generate data
+        # 5: make script to print out spaces, e.g. all rewards or all benchmarks
+
+        # NEW
+        # a: set up infra to run in parallel on devfair or devserver
+
+    finally:
         for env in envs:
             env.close()
-        raise
 
 
 if __name__ == "__main__":
