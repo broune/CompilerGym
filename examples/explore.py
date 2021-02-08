@@ -589,14 +589,7 @@ def make_state_json(env, sequence, observations, rewards):
     return node_data
 
 
-def main(argv):
-    """Main entry point."""
-    argv = FLAGS(argv)
-    if len(argv) != 1:
-        raise app.UsageError(f"Unknown command line arguments: {argv[1:]}")
-
-    print(f"Running with {FLAGS.nproc} threads.")
-    assert FLAGS.nproc >= 1
+def run():
     try:
         envs = []
         for _ in range(FLAGS.nproc):
@@ -617,7 +610,7 @@ def main(argv):
                 FLAGS.record_rewards,
             )
 
-            with open(FLAGS.record_file, "w") as f:
+            with open(FLAGS.record_file, "a") as f:
                 json.dump(json_obj, f, indent=2 if FLAGS.pretty_json else None)
         # TODO:
         #
@@ -632,6 +625,29 @@ def main(argv):
     finally:
         for env in envs:
             env.close()
+
+
+def main(argv):
+    """Main entry point."""
+    argv = FLAGS(argv)
+    if len(argv) != 1:
+        raise app.UsageError(f"Unknown command line arguments: {argv[1:]}")
+
+    print(f"Running with {FLAGS.nproc} threads.")
+    assert FLAGS.nproc >= 1
+
+    for n in range(1, 3):  # 122):
+        if n == 1:
+            with open(FLAGS.record_file, "w") as f:
+                f.write('{"data": [\n')
+        else:
+            with open(FLAGS.record_file, "a") as f:
+                f.write("\n,\n")
+
+        FLAGS.benchmark = f"benchmark://npb-v0/{n}"
+        run()
+    with open(FLAGS.record_file, "a") as f:
+        f.write("\n]}\n")
 
 
 if __name__ == "__main__":
